@@ -6,12 +6,19 @@ from datetime import datetime, timezone
 
 
 # Database configuration
+import os
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "interviewiq.db"
+DB_PATH = Path(
+    os.getenv(
+        "DATABASE_PATH",
+        str(DATA_DIR / "interviewiq.db")
+    )
+)
 
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 def get_connection():
     connection = sqlite3.connect(DB_PATH)
