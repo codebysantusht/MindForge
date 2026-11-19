@@ -7,27 +7,43 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-# Load environment variables
+
+# --------------------------------------------------
+# 1. LOAD ENVIRONMENT VARIABLES
+# --------------------------------------------------
+
 load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not API_KEY:
     raise ValueError(
-        "GEMINI_API_KEY was not found. Check your .env file."
+        "GEMINI_API_KEY was not found. Check your backend .env file."
     )
 
-# Initialize Gemini client
+
+# --------------------------------------------------
+# 2. INITIALIZE GEMINI CLIENT
+# --------------------------------------------------
+
 client = genai.Client(
     api_key=API_KEY,
     http_options=types.HttpOptions(timeout=120000)
 )
 
-# Primary and fallback models
-MODEL_NAME = "gemini-3.6-flash"
-FALLBACK_MODEL = "gemini-3.8-flash"
 
-# Generation configuration
+# --------------------------------------------------
+# 3. MODEL CONFIGURATION
+# --------------------------------------------------
+
+MODEL_NAME = "gemini-3.5-flash-lite"
+
+FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash"
+]
+
 GENERATION_CONFIG = types.GenerateContentConfig(
     thinking_config=types.ThinkingConfig(
         thinking_level="low"
@@ -36,21 +52,41 @@ GENERATION_CONFIG = types.GenerateContentConfig(
 )
 
 
+# --------------------------------------------------
+# 4. ERROR CLASSIFICATION
+# --------------------------------------------------
+
+TEMPORARY_ERRORS = [
+    "503",
+    "504",
+    "UNAVAILABLE",
+    "DEADLINE_EXCEEDED",
+    "429",
+    "RESOURCE_EXHAUSTED",
+    "408",
+    "TIMEOUT"
+]
+
+UNAVAILABLE_MODEL_ERRORS = [
+    "404",
+    "NOT_FOUND",
+    "MODEL NOT FOUND"
+]
+
+
+# --------------------------------------------------
+# 5. GEMINI GENERATION WITH AUTOMATIC FALLBACK
+# --------------------------------------------------
+
 def _generate(prompt):
-    """Generate text with automatic Gemini model fallback."""
+    """
+    Generate content using the primary Gemini model.
 
-    models = [MODEL_NAME, FALLBACK_MODEL]
+    If the primary model fails, automatically try fallback models.
+    Temporary errors receive one retry before switching models.
+    """
 
-    temporary_errors = [
-        "503",
-        "504",
-        "UNAVAILABLE",
-        "DEADLINE_EXCEEDED",
-        "429",
-        "RESOURCE_EXHAUSTED",
-        "NOT_FOUND",
-        "404"
-    ]
+    models = [MODEL_NAME] + FALLBACK_MODELS
 
     last_error = None
 
@@ -59,6 +95,7 @@ def _generate(prompt):
         for attempt in range(2):
 
             try:
+
                 print(f"Trying Gemini model: {model}")
 
                 response = client.models.generate_content(
@@ -70,9 +107,11 @@ def _generate(prompt):
                 result = response.text
 
                 if result and result.strip():
+
                     print(
                         f"Successfully generated using: {model}"
                     )
+
                     return result.strip()
 
                 raise RuntimeError(
@@ -84,33 +123,56 @@ def _generate(prompt):
                 last_error = error
                 message = str(error).upper()
 
-                is_temporary = any(
+                # Skip models that are unavailable.
+                if any(
                     marker in message
-                    for marker in temporary_errors
-                )
+                    for marker in UNAVAILABLE_MODEL_ERRORS
+                ):
 
-                if is_temporary and attempt == 0:
                     print(
-                        f"Temporary error with {model}. Retrying..."
+                        f"{model} is unavailable. "
+                        "Switching to the next model..."
                     )
-                    time.sleep(2)
-                    continue
 
-                if is_temporary:
-                    print(
-                        f"{model} unavailable. "
-                        "Trying fallback model..."
-                    )
                     break
 
+                # Retry temporary errors once.
+                if any(
+                    marker in message
+                    for marker in TEMPORARY_ERRORS
+                ):
+
+                    if attempt == 0:
+
+                        print(
+                            f"Temporary error with {model}. "
+                            "Retrying in 2 seconds..."
+                        )
+
+                        time.sleep(2)
+                        continue
+
+                    print(
+                        f"{model} failed after retry. "
+                        "Trying fallback model..."
+                    )
+
+                    break
+
+                # Do not retry permanent errors such as invalid API keys.
                 raise RuntimeError(
                     f"Gemini request failed with {model}: {error}"
                 ) from error
 
     raise RuntimeError(
-        f"All Gemini models failed. Last error: {last_error}"
+        "All Gemini models failed. "
+        f"Last error: {last_error}"
     )
 
+
+# --------------------------------------------------
+# 6. GENERATE INTERVIEW QUESTION
+# --------------------------------------------------
 
 def generate_question(role, level, interview_type):
 
@@ -135,6 +197,10 @@ Requirements:
 
     return _generate(prompt)
 
+
+# --------------------------------------------------
+# 7. EVALUATE CANDIDATE ANSWER
+# --------------------------------------------------
 
 def evaluate_answer(role, level, question, answer):
 
@@ -192,6 +258,7 @@ Rules:
 
     try:
 
+        # Extract JSON from the response.
         start = raw_response.find("{")
         end = raw_response.rfind("}") + 1
 
@@ -202,6 +269,7 @@ Rules:
 
         result = json.loads(raw_response[start:end])
 
+        # Required response fields.
         required_keys = [
             "score",
             "summary",
@@ -216,11 +284,13 @@ Rules:
         ]
 
         for key in required_keys:
+
             if key not in result:
                 raise ValueError(
                     f"Missing feedback field: {key}"
                 )
 
+        # Validate list fields.
         if not isinstance(result["strengths"], list):
             raise ValueError(
                 "Strengths must be a list."
@@ -233,16 +303,20 @@ Rules:
                 "Improvement areas must be a list."
             )
 
+        # Ensure feedback lists are not empty.
         if not result["strengths"]:
+
             result["strengths"] = [
                 "Review the answer against the scoring rubric."
             ]
 
         if not result["areas_for_improvement"]:
+
             result["areas_for_improvement"] = [
                 "Consider adding more detail or a practical example."
             ]
 
+        # Validate score.
         score = float(result["score"])
 
         if not 0 <= score <= 10:
@@ -250,11 +324,56 @@ Rules:
                 "Score must be between 0 and 10."
             )
 
+        # Validate rubric category totals.
+        rubric_fields = [
+            ("technical_correctness", 4),
+            ("relevance", 2),
+            ("clarity", 2),
+            ("completeness", 2)
+        ]
+
+        category_total = 0
+
+        for field, maximum in rubric_fields:
+
+            value = result[field]
+
+            if not isinstance(value, str) or "/" not in value:
+                raise ValueError(
+                    f"Invalid rubric format for {field}."
+                )
+
+            earned, possible = value.split("/", 1)
+
+            earned = float(earned.strip())
+            possible = float(possible.strip())
+
+            if possible != maximum:
+                raise ValueError(
+                    f"Invalid maximum score for {field}."
+                )
+
+            if not 0 <= earned <= maximum:
+                raise ValueError(
+                    f"Invalid score for {field}."
+                )
+
+            category_total += earned
+
+        if abs(category_total - score) > 0.01:
+            raise ValueError(
+                "Total score does not match rubric scores."
+            )
+
         result["score"] = score
 
         return result
 
-    except (ValueError, json.JSONDecodeError, TypeError) as error:
+    except (
+        ValueError,
+        json.JSONDecodeError,
+        TypeError
+    ) as error:
 
         raise RuntimeError(
             "The AI returned feedback in an unexpected format. "
